@@ -1,0 +1,11 @@
+__pycache__/
+.venv/
+.env/
+.vscode/
+
+# generated data (keep out of Git)
+ag_data/
+data/
+*.csv
+*.parquet
+*.zip
