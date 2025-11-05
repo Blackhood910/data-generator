@@ -1,14 +1,18 @@
-
-### `generate_ag_dataset.py`
-
 #!/usr/bin/env python3
 """
 Generate a realistic multi-channel retail dataset for Alison Kingsgate / MSK E-COM LTD.
 
+Changes in this version:
+- Guaranteed non-null order timestamps.
+- Adds split date/time columns in CLEAN export:
+    * order_date_only: YYYY-MM-DD (DATE)
+    * order_time_only: HH:MM:SS (TIME)
+- CLEAN orders are written directly from canonical timestamps (no re-parsing).
+
 Outputs
 - <base>/raw/*.csv     (intentionally messy sources)
 - <base>/clean/*.csv   (clean canonical tables)
-- <base>/create_tables.sql (PostgreSQL DDL)
+- <base>/create_tables.sql (MySQL/PostgreSQL-friendly DDL)
 - optional ZIP of everything
 
 Example:
@@ -37,7 +41,7 @@ def ensure_dirs(base):
     os.makedirs(raw, exist_ok=True); os.makedirs(clean, exist_ok=True)
     return raw, clean
 
-# cleaning helpers
+# cleaning helpers (for RAW → CLEAN where used)
 def clean_money_series(s: pd.Series) -> pd.Series:
     return (s.astype(str).str.replace("£","", regex=False)
              .str.replace(",","", regex=False).str.strip()
@@ -231,7 +235,7 @@ def generate_dataset(base_dir="./ag_data",
         platform_id = platform_code_to_id[plat_code]
         account_id = platform_id
         cust_id = int(np.random.randint(1, n_customers+1))
-        dt = rand_date(start_date, end_date)
+        dt = rand_date(start_date, end_date)  # canonical, guaranteed
         n_lines = random.choice([1,1,2,2,3])
 
         subtotal=0; disc=0; tax=0; ship_amt = money(random.choice([0,2.99,3.99,4.99]))
@@ -262,12 +266,25 @@ def generate_dataset(base_dir="./ag_data",
         status = rchoice_w(statuses,[0.05,0.10,0.72,0.08,0.05])
         delivery_days = int(np.random.choice([2,3,3,4,5,6])) if status in ("Shipped","Delivered","Returned") else None
 
+        # >>> NEW: include split columns directly, using canonical dt
         orders.append({
-            "order_id": oid,"order_number": f"{dt.year}-AK-{oid:06d}","order_date": dt,
-            "platform_id": platform_id,"account_id": account_id,"customer_id": cust_id,
-            "currency":"GBP","subtotal_amount": money(subtotal),"discount_amount": money(disc),
-            "tax_amount": money(tax),"shipping_amount": ship_amt,"channel_fee_amount": fee,
-            "total_amount": total,"order_status": status,"delivery_days": delivery_days
+            "order_id": oid,
+            "order_number": f"{dt.year}-AK-{oid:06d}",
+            "order_date": dt,                               # full timestamp
+            "order_date_only": dt.date().isoformat(),       # YYYY-MM-DD
+            "order_time_only": dt.strftime("%H:%M:%S"),     # HH:MM:SS
+            "platform_id": platform_id,
+            "account_id": account_id,
+            "customer_id": cust_id,
+            "currency": "GBP",
+            "subtotal_amount": money(subtotal),
+            "discount_amount": money(disc),
+            "tax_amount": money(tax),
+            "shipping_amount": ship_amt,
+            "channel_fee_amount": fee,
+            "total_amount": total,
+            "order_status": status,
+            "delivery_days": delivery_days
         })
         order_items += this_lines
         order_fees.append({"order_fee_id": len(order_fees)+1,"order_id": oid,"platform_id": platform_id,"fee_type":"Platform","fee_amount": fee})
@@ -296,6 +313,9 @@ def generate_dataset(base_dir="./ag_data",
         oid += 1
 
     orders_df = pd.DataFrame(orders)
+    # ensure dtype for .dt access (should already be datetime)
+    orders_df["order_date"] = pd.to_datetime(orders_df["order_date"], errors="coerce")
+
     order_items_df = pd.DataFrame(order_items)
     order_fees_df = pd.DataFrame(order_fees)
     payments_df = pd.DataFrame(payments)
@@ -331,7 +351,7 @@ def generate_dataset(base_dir="./ag_data",
         "reorder_point": random.randint(5,40),"safety_stock": random.randint(5,30)
     } for i, v in enumerate(variants_df.itertuples())])
 
-    # RAW (messy) copies for practice
+    # ---------- RAW copies for practice ----------
     def to_raw_products(df):
         raw = df.copy()
         raw["actual_price"] = raw["actual_price"].apply(lambda x: f"£{x}" if random.random()<0.7 else str(x))
@@ -354,7 +374,8 @@ def generate_dataset(base_dir="./ag_data",
     raw_products_df = to_raw_products(products_df)
     raw_orders_df   = to_raw_orders(orders_df)
 
-    # Clean the RAW back to canonical
+    # ---------- CLEAN tables ----------
+    # Products: keep original generated + also a cleaned version (example of cleaning)
     def clean_products(raw: pd.DataFrame) -> pd.DataFrame:
         df = raw.copy()
         df["actual_price"] = clean_money_series(df["actual_price"])
@@ -366,21 +387,17 @@ def generate_dataset(base_dir="./ag_data",
         df["rating"] = df.groupby("category_id")["rating"].transform(lambda s: s.fillna(s.mean().round(2) if s.notna().any() else 4.2))
         return df
 
-    def clean_orders(raw: pd.DataFrame) -> pd.DataFrame:
-        df = raw.copy()
-        df["order_date"] = parse_mixed_dt(df["order_date"])
-        for col in ["subtotal_amount","discount_amount","tax_amount","shipping_amount","channel_fee_amount","total_amount"]:
-            df[col] = clean_money_series(df[col]).clip(lower=0)
-        return df
-
     clean_products_df = clean_products(raw_products_df)
-    clean_orders_df   = clean_orders(raw_orders_df)
 
-    # write CSVs
+    # Orders: DO NOT re-parse; derive splits from canonical timestamps
+    orders_df["order_date_only"] = orders_df["order_date"].dt.date.astype(str)
+    orders_df["order_time_only"] = orders_df["order_date"].dt.strftime("%H:%M:%S")
+
+    # ---------- WRITE CSVs ----------
     def write_csv(df, name, folder):
         df.to_csv(os.path.join(folder, f"{name}.csv"), index=False)
 
-    # clean
+    # clean (canonical)
     write_csv(brands, "brands", clean_dir)
     write_csv(platforms, "platforms", clean_dir)
     write_csv(categories, "categories", clean_dir)
@@ -402,52 +419,121 @@ def generate_dataset(base_dir="./ag_data",
     write_csv(reviews_df, "reviews", clean_dir)
     write_csv(warehouses_df, "warehouses", clean_dir)
     write_csv(inventory_df, "inventory", clean_dir)
-    write_csv(orders_df, "orders_clean_generated", clean_dir)
-    write_csv(clean_orders_df, "orders", clean_dir)
 
-    # RAW
+    # orders (export canonical & split columns)
+    write_csv(orders_df, "orders_clean_generated", clean_dir)  # for comparison/debug
+    write_csv(orders_df, "orders", clean_dir)                  # main clean file used by loader
+
+    # RAW sources (for cleaning practice)
     raw_products_df.to_csv(os.path.join(raw_dir, "products_raw.csv"), index=False)
     raw_orders_df.to_csv(os.path.join(raw_dir, "orders_raw.csv"), index=False)
 
-    # Postgres DDL
+    # ---------- DDL (includes split columns) ----------
     ddl = """
 CREATE SCHEMA IF NOT EXISTS ag_oltp;
-CREATE TABLE IF NOT EXISTS ag_oltp.brands (brand_id INT PRIMARY KEY, brand_name TEXT NOT NULL, website_url TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.platforms (platform_id INT PRIMARY KEY, platform_code TEXT NOT NULL, platform_name TEXT NOT NULL, region TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.categories (category_id INT PRIMARY KEY, parent_category_id INT NULL, category_name TEXT NOT NULL, category_path TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.products (product_id INT PRIMARY KEY, sku TEXT, product_name TEXT NOT NULL, category_id INT, brand_id INT,
+
+CREATE TABLE IF NOT EXISTS ag_oltp.brands (
+  brand_id INT PRIMARY KEY, brand_name TEXT NOT NULL, website_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.platforms (
+  platform_id INT PRIMARY KEY, platform_code TEXT NOT NULL, platform_name TEXT NOT NULL, region TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.categories (
+  category_id INT PRIMARY KEY, parent_category_id INT NULL, category_name TEXT NOT NULL, category_path TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.products (
+  product_id INT PRIMARY KEY, sku TEXT, product_name TEXT NOT NULL, category_id INT, brand_id INT,
   actual_price NUMERIC(10,2), discounted_price NUMERIC(10,2), discount_percentage NUMERIC(6,4),
   rating NUMERIC(3,2), rating_count INT, about_product TEXT, img_link TEXT, product_link TEXT,
-  status TEXT, unit_cost NUMERIC(10,2), default_list_price NUMERIC(10,2));
-CREATE TABLE IF NOT EXISTS ag_oltp.product_variants (variant_id INT PRIMARY KEY, product_id INT, variant_sku TEXT, size_code TEXT,
+  status TEXT, unit_cost NUMERIC(10,2), default_list_price NUMERIC(10,2)
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.product_variants (
+  variant_id INT PRIMARY KEY, product_id INT, variant_sku TEXT, size_code TEXT,
   width_mm INT, height_mm INT, frame_material TEXT, frame_finish TEXT, frame_profile TEXT, glazing_type TEXT,
   mount_included_flag BOOLEAN, mount_color TEXT, backing_type TEXT, orientation TEXT,
   unit_cost NUMERIC(10,2), default_list_price NUMERIC(10,2), weight_kg NUMERIC(8,2),
-  package_length_mm INT, package_width_mm INT, package_height_mm INT, status TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.marketplace_accounts (account_id INT PRIMARY KEY, platform_id INT, merchant_slug TEXT, default_currency TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.product_listings (listing_id INT PRIMARY KEY, product_id INT, variant_id INT NULL, platform_id INT, account_id INT,
-  listing_sku TEXT, title TEXT, subtitle TEXT, description_html TEXT, bullets_json JSONB,
-  main_image_url TEXT, additional_images_json JSONB,
+  package_length_mm INT, package_width_mm INT, package_height_mm INT, status TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.marketplace_accounts (
+  account_id INT PRIMARY KEY, platform_id INT, merchant_slug TEXT, default_currency TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.product_listings (
+  listing_id INT PRIMARY KEY, product_id INT, variant_id INT NULL, platform_id INT, account_id INT,
+  listing_sku TEXT, title TEXT, subtitle TEXT, description_html TEXT, bullets_json JSON,
+  main_image_url TEXT, additional_images_json JSON,
   amazon_asin TEXT, amazon_marketplace_id TEXT, amazon_fulfilment_channel TEXT,
-  ebay_item_id TEXT, ebay_listing_type TEXT, ebay_condition_id INT, ebay_category_id INT, is_active BOOLEAN);
-CREATE TABLE IF NOT EXISTS ag_oltp.listing_prices (price_id INT PRIMARY KEY, listing_id INT, currency TEXT, listing_price NUMERIC(10,2),
-  sale_price NUMERIC(10,2), valid_from DATE, valid_to DATE NULL);
-CREATE TABLE IF NOT EXISTS ag_oltp.platform_fees (platform_fee_id INT PRIMARY KEY, platform_id INT, fee_type TEXT, fee_percent NUMERIC(6,4), fee_flat_amount NUMERIC(10,2));
-CREATE TABLE IF NOT EXISTS ag_oltp.channel_inventory (channel_inventory_id INT PRIMARY KEY, listing_id INT, on_hand_qty INT, reserved_qty INT, backorder_qty INT);
-CREATE TABLE IF NOT EXISTS ag_oltp.customers (customer_id INT PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT, phone TEXT, gender TEXT, age_group TEXT, region TEXT,
-  signup_source TEXT, preferred_platform TEXT, repeat_customer_flag BOOLEAN);
-CREATE TABLE IF NOT EXISTS ag_oltp.orders (order_id INT PRIMARY KEY, order_number TEXT, order_date TIMESTAMP, platform_id INT, account_id INT, customer_id INT, currency TEXT,
+  ebay_item_id TEXT, ebay_listing_type TEXT, ebay_condition_id INT, ebay_category_id INT, is_active BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.listing_prices (
+  price_id INT PRIMARY KEY, listing_id INT, currency TEXT, listing_price NUMERIC(10,2),
+  sale_price NUMERIC(10,2), valid_from DATE, valid_to DATE NULL
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.platform_fees (
+  platform_fee_id INT PRIMARY KEY, platform_id INT, fee_type TEXT, fee_percent NUMERIC(6,4), fee_flat_amount NUMERIC(10,2)
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.channel_inventory (
+  channel_inventory_id INT PRIMARY KEY, listing_id INT, on_hand_qty INT, reserved_qty INT, backorder_qty INT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.customers (
+  customer_id INT PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT, phone TEXT, gender TEXT, age_group TEXT, region TEXT,
+  signup_source TEXT, preferred_platform TEXT, repeat_customer_flag BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.orders (
+  order_id INT PRIMARY KEY, order_number TEXT, order_date TIMESTAMP,
+  order_date_only DATE, order_time_only TIME,
+  platform_id INT, account_id INT, customer_id INT, currency TEXT,
   subtotal_amount NUMERIC(12,2), discount_amount NUMERIC(12,2), tax_amount NUMERIC(12,2), shipping_amount NUMERIC(12,2),
-  channel_fee_amount NUMERIC(12,2), total_amount NUMERIC(12,2), order_status TEXT, delivery_days INT NULL);
-CREATE TABLE IF NOT EXISTS ag_oltp.order_items (order_item_id INT PRIMARY KEY, order_id INT, line_number INT, product_id INT, variant_id INT, listing_id INT,
+  channel_fee_amount NUMERIC(12,2), total_amount NUMERIC(12,2), order_status TEXT, delivery_days INT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.order_items (
+  order_item_id INT PRIMARY KEY, order_id INT, line_number INT, product_id INT, variant_id INT, listing_id INT,
   quantity INT, unit_price NUMERIC(12,2), line_subtotal NUMERIC(12,2), line_discount NUMERIC(12,2),
-  line_tax NUMERIC(12,2), line_total NUMERIC(12,2), unit_cost NUMERIC(12,2), margin_amount NUMERIC(12,2));
-CREATE TABLE IF NOT EXISTS ag_oltp.order_fees (order_fee_id INT PRIMARY KEY, order_id INT, platform_id INT, fee_type TEXT, fee_amount NUMERIC(12,2));
-CREATE TABLE IF NOT EXISTS ag_oltp.payments (payment_id INT PRIMARY KEY, order_id INT, payment_method TEXT, provider_txn_id TEXT, amount NUMERIC(12,2), status TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.shipments (shipment_id INT PRIMARY KEY, order_id INT, carrier TEXT, tracking_number TEXT, shipped_at TIMESTAMP, delivered_at TIMESTAMP NULL, delivery_status TEXT);
-CREATE TABLE IF NOT EXISTS ag_oltp.returns (return_id INT PRIMARY KEY, order_id INT, return_number TEXT, status TEXT, initiated_at TIMESTAMP);
-CREATE TABLE IF NOT EXISTS ag_oltp.return_items (return_item_id INT PRIMARY KEY, return_id INT, order_item_id INT, quantity_returned INT, return_reason TEXT, refund_amount NUMERIC(12,2));
-CREATE TABLE IF NOT EXISTS ag_oltp.reviews (review_id TEXT PRIMARY KEY, product_id INT, variant_id INT NULL, source_platform TEXT, user_id TEXT, user_name TEXT, review_title TEXT, review_content TEXT, rating INT);
+  line_tax NUMERIC(12,2), line_total NUMERIC(12,2), unit_cost NUMERIC(12,2), margin_amount NUMERIC(12,2)
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.order_fees (
+  order_fee_id INT PRIMARY KEY, order_id INT, platform_id INT, fee_type TEXT, fee_amount NUMERIC(12,2)
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.payments (
+  payment_id INT PRIMARY KEY, order_id INT, payment_method TEXT, provider_txn_id TEXT, amount NUMERIC(12,2), status TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.shipments (
+  shipment_id INT PRIMARY KEY, order_id INT, carrier TEXT, tracking_number TEXT, shipped_at TIMESTAMP, delivered_at TIMESTAMP NULL, delivery_status TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.returns (
+  return_id INT PRIMARY KEY, order_id INT, return_number TEXT, status TEXT, initiated_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.return_items (
+  return_item_id INT PRIMARY KEY, return_id INT, order_item_id INT, quantity_returned INT, return_reason TEXT, refund_amount NUMERIC(12,2)
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.reviews (
+  review_id TEXT PRIMARY KEY, product_id INT, variant_id INT NULL, source_platform TEXT, user_id TEXT, user_name TEXT, review_title TEXT, review_content TEXT, rating INT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.warehouses (
+  warehouse_id INT PRIMARY KEY, warehouse_code TEXT, warehouse_name TEXT, city TEXT, country TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ag_oltp.inventory (
+  inventory_id INT PRIMARY KEY, variant_id INT, warehouse_id INT, on_hand_qty INT, reserved_qty INT, reorder_point INT, safety_stock INT
+);
 """
     with open(os.path.join(base_dir, "create_tables.sql"), "w", encoding="utf-8") as f:
         f.write(ddl)
